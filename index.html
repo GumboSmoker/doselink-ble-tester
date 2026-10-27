@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DoseLink BLE Tester</title>
+<style>
+  :root { --bg:#f7f5f0; --card:#ffffff; --ink:#1d2a24; --muted:#6b7a72; --accent:#4f7a5c; --line:#d9d6cc; --bad:#b3402f; --good:#2f7d4f; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#151a17; --card:#1e2521; --ink:#e8ede9; --muted:#93a39a; --accent:#7fb08e; --line:#33403a; --bad:#e07a68; --good:#6fcf97; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--ink); font:16px/1.4 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width: 760px; margin: 0 auto; display:grid; gap:12px; }
+  h1 { font-size:1.3rem; margin:0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  button { font:inherit; padding:9px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input { font:inherit; padding:9px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--ink); min-width:0; }
+  input[type=number] { width:90px; }
+  #cmd { flex:1; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--bad); display:inline-block; }
+  .dot.on { background:var(--good); }
+  .stat { font-size:1.6rem; font-weight:600; }
+  .label { color:var(--muted); font-size:.85rem; }
+  #log { height:260px; overflow:auto; font:13px/1.45 ui-monospace,Consolas,monospace; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px; white-space:pre-wrap; }
+  .tx { color:var(--accent); } .rx { color:var(--ink); } .err { color:var(--bad); } .sys { color:var(--muted); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>DoseLink BLE Tester</h1>
+
+  <div class="card">
+    <div class="row">
+      <button id="connect" class="primary">Connect</button>
+      <button id="disconnect" disabled>Disconnect</button>
+      <span><span id="dot" class="dot"></span> <span id="status">Not connected</span></span>
+    </div>
+    <p id="support" class="label" style="margin:10px 0 0"></p>
+  </div>
+
+  <div class="card grid">
+    <div><div class="label">IR beam</div><div class="stat" id="ir">–</div></div>
+    <div><div class="label">Pills counted</div><div class="stat" id="pills">0</div></div>
+    <div><div class="label">Last result</div><div class="stat" id="result">–</div></div>
+  </div>
+
+  <div class="card">
+    <div class="label" style="margin-bottom:8px">Quick tests</div>
+    <div class="row" style="margin-bottom:8px">
+      <button data-cmd="PING">Ping</button>
+      <button data-cmd="IR">Read IR</button>
+      <button data-cmd="STATUS">Status</button>
+      <button data-cmd="DIR 1">Dir 1</button>
+      <button data-cmd="DIR 0">Dir 0</button>
+      <button data-cmd="STOP" class="danger">STOP</button>
+    </div>
+    <div class="row" style="margin-bottom:8px">
+      <label class="label">Steps</label><input id="steps" type="number" value="200" min="1" max="20000">
+      <button id="stepBtn">Step motor</button>
+      <label class="label">Speed µs</label><input id="speed" type="number" value="1000" min="200">
+      <button id="speedBtn">Set</button>
+    </div>
+    <div class="row">
+      <label class="label">Pills</label><input id="count" type="number" value="2" min="1" max="20">
+      <button id="dispBtn" class="primary">Dispense</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:8px">
+      <input id="cmd" placeholder="Type a command, press Enter (e.g. STEP 400)" autocomplete="off">
+      <button id="send">Send</button>
+      <button id="clear">Clear log</button>
+    </div>
+    <div id="log"></div>
+  </div>
+</main>
+
+<script>
+const SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // page -> ESP32
+const TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // ESP32 -> page
+
+let device, rxChar, txChar, buffer = '';
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+if (!navigator.bluetooth) {
+  $('support').textContent = 'This browser has no Web Bluetooth. Use Chrome or Edge on desktop/Android, or Bluefy on iPhone.';
+  $('connect').disabled = true;
+} else {
+  $('support').textContent = 'Web Bluetooth available. Click Connect and pick "DoseLink-Test".';
+}
+
+function log(text, cls = 'sys') {
+  const div = document.createElement('div');
+  div.className = cls; div.textContent = text;
+  $('log').appendChild(div); $('log').scrollTop = $('log').scrollHeight;
+}
+
+function setConnected(on) {
+  $('dot').classList.toggle('on', on);
+  $('status').textContent = on ? 'Connected to ' + (device?.name || 'device') : 'Not connected';
+  $('connect').disabled = on; $('disconnect').disabled = !on;
+  document.querySelectorAll('[data-cmd],#stepBtn,#speedBtn,#dispBtn,#send').forEach(b => b.disabled = !on);
+}
+setConnected(false);
+
+async function connect() {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'DoseLink' }],
+      optionalServices: [SERVICE]
+    });
+    device.addEventListener('gattserverdisconnected', () => { setConnected(false); log('Disconnected', 'err'); });
+    log('Connecting to ' + device.name + '…');
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE);
+    rxChar = await svc.getCharacteristic(RX);
+    txChar = await svc.getCharacteristic(TX);
+    await txChar.startNotifications();
+    txChar.addEventListener('characteristicvaluechanged', onData);
+    setConnected(true);
+    log('Connected', 'sys');
+  } catch (e) { log('Connect failed: ' + e.message, 'err'); setConnected(false); }
+}
+
+function onData(ev) {
+  buffer += dec.decode(ev.target.value);
+  let i;
+  while ((i = buffer.indexOf('\n')) >= 0) {
+    const line = buffer.slice(0, i).trim(); buffer = buffer.slice(i + 1);
+    if (line) handleLine(line);
+  }
+}
+
+function handleLine(line) {
+  log('< ' + line, line.startsWith('ERR') || line.startsWith('TIMEOUT') ? 'err' : 'rx');
+  const [kind, val] = line.split(' ');
+  if (kind === 'IR') $('ir').textContent = val === '1' ? 'BLOCKED' : 'clear';
+  if (kind === 'PILL') $('pills').textContent = val;
+  if (['DONE', 'TIMEOUT', 'STOPPED'].includes(kind)) $('result').textContent = kind + (val ? ' ' + val : '');
+}
+
+async function send(cmd) {
+  if (!rxChar) return;
+  if (cmd.toUpperCase().startsWith('DISPENSE')) $('pills').textContent = '0';
+  log('> ' + cmd, 'tx');
+  try {
+    // chunk to 20 bytes so default MTU always works
+    const bytes = enc.encode(cmd + '\n');
+    for (let o = 0; o < bytes.length; o += 20) await rxChar.writeValueWithoutResponse(bytes.slice(o, o + 20));
+  } catch (e) { log('Send failed: ' + e.message, 'err'); }
+}
+
+$('connect').onclick = connect;
+$('disconnect').onclick = () => device?.gatt.disconnect();
+document.querySelectorAll('[data-cmd]').forEach(b => b.onclick = () => send(b.dataset.cmd));
+$('stepBtn').onclick = () => send('STEP ' + $('steps').value);
+$('speedBtn').onclick = () => send('SPEED ' + $('speed').value);
+$('dispBtn').onclick = () => send('DISPENSE ' + $('count').value);
+$('send').onclick = () => { const v = $('cmd').value.trim(); if (v) { send(v); $('cmd').value = ''; } };
+$('cmd').onkeydown = e => { if (e.key === 'Enter') $('send').click(); };
+$('clear').onclick = () => $('log').innerHTML = '';
+</script>
+</body>
+</html>
